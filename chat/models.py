@@ -12,6 +12,7 @@ class Conversation(models.Model):
         choices=[('web', 'Web'), ('whatsapp', 'WhatsApp'), ('api_test', 'Test API')],
         default='api_test',
     )
+    whatsapp_id = models.CharField(max_length=32, unique=True, null=True, blank=True)
     langue_detectee = models.CharField(max_length=5, blank=True)
     date_creation = models.DateTimeField(auto_now_add=True)
     date_derniere_activite = models.DateTimeField(auto_now=True)
@@ -30,6 +31,7 @@ class Message(models.Model):
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='messages')
     role = models.CharField(max_length=10, choices=[('user', 'Utilisateur'), ('assistant', 'Assistant')])
     contenu = models.TextField()
+    external_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
     # Sources citées (liste de titres/IDs de documents) — pour audit/traçabilité (Étape 5)
     sources_utilisees = models.JSONField(default=list, blank=True)
     date_creation = models.DateTimeField(auto_now_add=True)

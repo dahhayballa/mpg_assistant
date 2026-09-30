@@ -85,6 +85,11 @@ MPG_ASSISTANT = {
     # Clé API pour le LLM (Étape 6 : fournisseur externe). Jamais en dur.
     'ANTHROPIC_API_KEY': os.environ.get('ANTHROPIC_API_KEY', ''),
     'LLM_MODEL': os.environ.get('MPG_LLM_MODEL', 'claude-sonnet-4-6'),
+    'WHATSAPP_ACCESS_TOKEN': os.environ.get('WHATSAPP_ACCESS_TOKEN', ''),
+    'WHATSAPP_PHONE_NUMBER_ID': os.environ.get('WHATSAPP_PHONE_NUMBER_ID', ''),
+    'WHATSAPP_VERIFY_TOKEN': os.environ.get('WHATSAPP_VERIFY_TOKEN', ''),
+    'WHATSAPP_APP_SECRET': os.environ.get('WHATSAPP_APP_SECRET', ''),
+    'WHATSAPP_API_VERSION': os.environ.get('WHATSAPP_API_VERSION', 'v23.0'),
     # Nombre de passages (chunks) remontés par la recherche (Étape 5)
     'RAG_TOP_K': int(os.environ.get('MPG_RAG_TOP_K', '5')),
     # Nombre de derniers messages injectés comme contexte conversationnel (Étape 10)

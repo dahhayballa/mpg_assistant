@@ -1,8 +1,18 @@
+import hashlib
+import hmac
+import json
+import logging
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
 import re
 
 from django.conf import settings
+from django.http import HttpResponse, HttpResponseForbidden, HttpResponseServerError
 from django.shortcuts import get_object_or_404, render
+from django.utils.decorators import method_decorator
 from django.views.generic import TemplateView
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -13,6 +23,7 @@ from chat.models import Conversation, Message, QuestionSansReponse
 from .serializers import ChatRequestSerializer, ChatResponseSerializer
 
 _ARABIC_RE = re.compile(r'[\u0600-\u06FF]')
+logger = logging.getLogger(__name__)
 
 
 class IndexView(TemplateView):
@@ -65,7 +76,10 @@ class ChatView(APIView):
     def post(self, request):
         serializer = ChatRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
+        return Response(self.process(serializer.validated_data))
+
+    def process(self, data):
+        """Process an already validated chat payload for every channel."""
 
         message_utilisateur = data['message'].strip()
         canal = data.get('canal', 'api_test')
@@ -78,7 +92,12 @@ class ChatView(APIView):
         else:
             conversation = Conversation.objects.create(canal=canal, langue_detectee=langue)
 
-        Message.objects.create(conversation=conversation, role='user', contenu=message_utilisateur)
+        Message.objects.create(
+            conversation=conversation,
+            role='user',
+            contenu=message_utilisateur,
+            external_id=data.get('external_message_id'),
+        )
 
         historique_size = settings.MPG_ASSISTANT['CONVERSATION_HISTORY_SIZE']
         derniers_messages = list(
@@ -107,7 +126,7 @@ class ChatView(APIView):
                 'sources': [],
                 'trouve_quelque_chose': True,
             })
-            return Response(output.data)
+            return output.data
 
         if is_prompt_injection(message_utilisateur):
             reponse_injection = (
@@ -126,7 +145,7 @@ class ChatView(APIView):
                 'sources': [],
                 'trouve_quelque_chose': False,
             })
-            return Response(output.data)
+            return output.data
 
         if is_out_of_scope(message_utilisateur):
             reponse_hors_perimetre = (
@@ -145,7 +164,7 @@ class ChatView(APIView):
                 'sources': [],
                 'trouve_quelque_chose': False,
             })
-            return Response(output.data)
+            return output.data
 
         # --- RAG (Étape 5) ---
         rag_result = retrieve(message_utilisateur, langue=langue)
@@ -204,4 +223,118 @@ class ChatView(APIView):
             'sources': rag_result.sources,
             'trouve_quelque_chose': rag_result.trouve_quelque_chose,
         })
-        return Response(output.data)
+        return output.data
+
+
+def send_whatsapp_message(recipient: str, text: str) -> None:
+    config = settings.MPG_ASSISTANT
+    access_token = config['WHATSAPP_ACCESS_TOKEN']
+    phone_number_id = config['WHATSAPP_PHONE_NUMBER_ID']
+    if not access_token or not phone_number_id:
+        raise RuntimeError('WhatsApp Cloud API credentials are not configured.')
+
+    url = (
+        f"https://graph.facebook.com/{config['WHATSAPP_API_VERSION']}/"
+        f"{phone_number_id}/messages"
+    )
+    payload = {
+        'messaging_product': 'whatsapp',
+        'recipient_type': 'individual',
+        'to': recipient,
+        'type': 'text',
+        'text': {'preview_url': False, 'body': text[:4096]},
+    }
+    request = Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    try:
+        with urlopen(request, timeout=20):
+            return
+    except HTTPError as exc:
+        raise RuntimeError(f'WhatsApp Cloud API returned HTTP {exc.code}.') from exc
+    except URLError as exc:
+        raise RuntimeError('Could not reach WhatsApp Cloud API.') from exc
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class WhatsAppWebhookView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        config = settings.MPG_ASSISTANT
+        if (
+            request.GET.get('hub.mode') == 'subscribe'
+            and hmac.compare_digest(
+                request.GET.get('hub.verify_token', ''), config['WHATSAPP_VERIFY_TOKEN'],
+            )
+            and config['WHATSAPP_VERIFY_TOKEN']
+        ):
+            return HttpResponse(request.GET.get('hub.challenge', ''))
+        return HttpResponseForbidden('Webhook verification failed.')
+
+    def post(self, request):
+        config = settings.MPG_ASSISTANT
+        app_secret = config['WHATSAPP_APP_SECRET']
+        signature = request.headers.get('X-Hub-Signature-256', '')
+        expected_signature = 'sha256=' + hmac.new(
+            app_secret.encode('utf-8'), request.body, hashlib.sha256,
+        ).hexdigest() if app_secret else ''
+        if not app_secret or not hmac.compare_digest(signature, expected_signature):
+            return HttpResponseForbidden('Invalid webhook signature.')
+
+        try:
+            payload = json.loads(request.body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return HttpResponse('Invalid JSON.', status=400)
+
+        for entry in payload.get('entry', []):
+            for change in entry.get('changes', []):
+                value = change.get('value', {})
+                for inbound in value.get('messages', []):
+                    if inbound.get('type') != 'text':
+                        continue
+                    sender = inbound.get('from')
+                    message_id = inbound.get('id')
+                    text = inbound.get('text', {}).get('body', '').strip()
+                    if not sender or not message_id or not text:
+                        continue
+
+                    try:
+                        conversation, _ = Conversation.objects.get_or_create(
+                            whatsapp_id=sender,
+                            defaults={
+                                'canal': 'whatsapp',
+                                'langue_detectee': _detecter_langue(text),
+                            },
+                        )
+                        previous_message = Message.objects.filter(
+                            external_id=message_id, role='user',
+                        ).select_related('conversation').first()
+                        if previous_message:
+                            previous_answer = previous_message.conversation.messages.filter(
+                                role='assistant',
+                                date_creation__gte=previous_message.date_creation,
+                            ).first()
+                            if previous_answer:
+                                send_whatsapp_message(sender, previous_answer.contenu)
+                            continue
+
+                        answer = ChatView().process({
+                            'message': text[:2000],
+                            'canal': 'whatsapp',
+                            'session_id': conversation.session_id,
+                            'external_message_id': message_id,
+                        })
+                        send_whatsapp_message(sender, answer['reponse'])
+                    except Exception:
+                        logger.exception('Failed to process an incoming WhatsApp message.')
+                        return HttpResponseServerError('Message processing failed.')
+
+        return HttpResponse('EVENT_RECEIVED')

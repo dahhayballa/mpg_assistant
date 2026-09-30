@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 import os
 import sys
 import tempfile
@@ -9,7 +12,7 @@ from django.conf import settings
 from django.test import SimpleTestCase
 from rest_framework.test import APITestCase
 
-from chat.models import Message, QuestionSansReponse
+from chat.models import Conversation, Message, QuestionSansReponse
 from knowledge.models import Document, FAQ
 
 
@@ -191,3 +194,76 @@ class ChatEndpointIntegrationTests(APITestCase):
     def test_empty_message_is_rejected(self):
         response = self.client.post('/api/chat/', {'message': ''}, format='json')
         self.assertEqual(response.status_code, 400)
+
+
+class WhatsAppWebhookTests(APITestCase):
+    def setUp(self):
+        self.previous_settings = dict(settings.MPG_ASSISTANT)
+        settings.MPG_ASSISTANT.update({
+            'WHATSAPP_ACCESS_TOKEN': 'test-access-token',
+            'WHATSAPP_PHONE_NUMBER_ID': '123456789',
+            'WHATSAPP_VERIFY_TOKEN': 'test-verify-token',
+            'WHATSAPP_APP_SECRET': 'test-app-secret',
+            'WHATSAPP_API_VERSION': 'v23.0',
+        })
+        self.addCleanup(settings.MPG_ASSISTANT.update, self.previous_settings)
+
+    def _send_text_event(self, message_id='wamid.test-message'):
+        payload = {
+            'object': 'whatsapp_business_account',
+            'entry': [{
+                'changes': [{
+                    'value': {
+                        'messages': [{
+                            'from': '22212345678',
+                            'id': message_id,
+                            'type': 'text',
+                            'text': {'body': 'السلام عليكم'},
+                        }],
+                    },
+                }],
+            }],
+        }
+        body = json.dumps(payload).encode('utf-8')
+        signature = 'sha256=' + hmac.new(
+            b'test-app-secret', body, hashlib.sha256,
+        ).hexdigest()
+        return self.client.generic(
+            'POST',
+            '/api/whatsapp/webhook/',
+            body,
+            content_type='application/json',
+            HTTP_X_HUB_SIGNATURE_256=signature,
+        )
+
+    def test_meta_webhook_verification(self):
+        response = self.client.get('/api/whatsapp/webhook/', {
+            'hub.mode': 'subscribe',
+            'hub.verify_token': 'test-verify-token',
+            'hub.challenge': 'challenge-123',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'challenge-123')
+
+    def test_webhook_rejects_invalid_signature(self):
+        response = self.client.generic(
+            'POST', '/api/whatsapp/webhook/', b'{}',
+            content_type='application/json',
+            HTTP_X_HUB_SIGNATURE_256='sha256=invalid',
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_incoming_message_gets_reply_and_duplicate_is_not_saved_twice(self):
+        with patch('api.views.send_whatsapp_message') as send_message:
+            first = self._send_text_event()
+            second = self._send_text_event()
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        conversation = Conversation.objects.get(whatsapp_id='22212345678')
+        self.assertEqual(conversation.canal, 'whatsapp')
+        self.assertEqual(
+            Message.objects.filter(conversation=conversation, role='user').count(), 1,
+        )
+        self.assertEqual(send_message.call_count, 2)
+        self.assertIn('وعليكم السلام', send_message.call_args.args[1])
