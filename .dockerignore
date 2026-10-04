@@ -1,0 +1,20 @@
+# Secrets et données locales : jamais dans l'image.
+.env
+db.sqlite3
+
+.git
+.gitignore
+.venv
+venv
+.vscode
+__pycache__
+*.pyc
+staticfiles
+
+# Outils locaux Windows (tunnel WhatsApp)
+*.bat
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+render.yaml

@@ -208,21 +208,26 @@ class WhatsAppWebhookTests(APITestCase):
         })
         self.addCleanup(settings.MPG_ASSISTANT.update, self.previous_settings)
 
-    def _send_text_event(self, message_id='wamid.test-message'):
+    def _send_text_event(self, message_id='wamid.test-message', body='السلام عليكم'):
+        return self._send_event({
+            'from': '22212345678',
+            'id': message_id,
+            'type': 'text',
+            'text': {'body': body},
+        })
+
+    def _send_choice_event(self, message_id, choice_id, kind='button_reply'):
+        return self._send_event({
+            'from': '22212345678',
+            'id': message_id,
+            'type': 'interactive',
+            'interactive': {'type': kind, kind: {'id': choice_id, 'title': choice_id}},
+        })
+
+    def _send_event(self, inbound):
         payload = {
             'object': 'whatsapp_business_account',
-            'entry': [{
-                'changes': [{
-                    'value': {
-                        'messages': [{
-                            'from': '22212345678',
-                            'id': message_id,
-                            'type': 'text',
-                            'text': {'body': 'السلام عليكم'},
-                        }],
-                    },
-                }],
-            }],
+            'entry': [{'changes': [{'value': {'messages': [inbound]}}]}],
         }
         body = json.dumps(payload).encode('utf-8')
         signature = 'sha256=' + hmac.new(
@@ -253,17 +258,53 @@ class WhatsAppWebhookTests(APITestCase):
         )
         self.assertEqual(response.status_code, 403)
 
-    def test_incoming_message_gets_reply_and_duplicate_is_not_saved_twice(self):
+    def test_first_message_asks_for_language_then_shows_menu(self):
+        with patch('api.views._send_whatsapp_payload') as send_payload:
+            self.assertEqual(self._send_text_event('wamid.1').status_code, 200)
+            self.assertEqual(self._send_choice_event('wamid.2', 'lang_fr').status_code, 200)
+
+        language_prompt = send_payload.call_args_list[0].args[1]
+        self.assertEqual(language_prompt['interactive']['type'], 'button')
+        menu = send_payload.call_args_list[1].args[1]
+        self.assertEqual(menu['interactive']['type'], 'list')
+        self.assertEqual(menu['interactive']['action']['button'], 'Voir les options')
+        conversation = Conversation.objects.get(whatsapp_id='22212345678')
+        self.assertEqual(conversation.canal, 'whatsapp')
+        self.assertEqual(conversation.langue_detectee, 'fr')
+
+    def test_menu_choice_answers_in_chosen_language(self):
+        FAQ.objects.create(
+            question='Le stage est-il obligatoire ?', reponse='Oui, deux stages.',
+            langue='fr', categorie='stages', statut_activite='actif',
+        )
+        Conversation.objects.create(
+            whatsapp_id='22212345678', canal='whatsapp', langue_detectee='fr',
+        )
+        with patch('api.views.send_whatsapp_message') as send_message:
+            self._send_choice_event('wamid.3', 'menu_stages', kind='list_reply')
+
+        self.assertTrue(send_message.call_args.args[1].startswith('Oui, deux stages.'))
+        self.assertIn('Tapez 0', send_message.call_args.args[1])
+
+    def test_free_question_is_answered_in_its_own_language(self):
+        Conversation.objects.create(
+            whatsapp_id='22212345678', canal='whatsapp', langue_detectee='ar',
+        )
+        with patch('api.views.send_whatsapp_message') as send_message:
+            self._send_text_event('wamid.4', body='Bonjour')
+
+        self.assertTrue(send_message.call_args.args[1].startswith('Bonjour !'))
+
+    def test_duplicate_message_is_not_saved_twice(self):
+        Conversation.objects.create(
+            whatsapp_id='22212345678', canal='whatsapp', langue_detectee='ar',
+        )
         with patch('api.views.send_whatsapp_message') as send_message:
             first = self._send_text_event()
             second = self._send_text_event()
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
-        conversation = Conversation.objects.get(whatsapp_id='22212345678')
-        self.assertEqual(conversation.canal, 'whatsapp')
-        self.assertEqual(
-            Message.objects.filter(conversation=conversation, role='user').count(), 1,
-        )
+        self.assertEqual(Message.objects.filter(role='user').count(), 1)
         self.assertEqual(send_message.call_count, 2)
         self.assertIn('وعليكم السلام', send_message.call_args.args[1])

@@ -226,7 +226,85 @@ class ChatView(APIView):
         return output.data
 
 
-def send_whatsapp_message(recipient: str, text: str) -> None:
+# --- WhatsApp (Étape 12) : parcours guidé type « choix de langue + menu » ---
+# Chaque entrée du menu pointe vers le libellé exact d'une FAQ validée, ce qui
+# garantit une correspondance exacte dans retrieve() (score 1.0).
+WHATSAPP_INVITE_LANGUE = 'يرجى اختيار لغتك المفضلة:\nVeuillez choisir votre langue :'
+WHATSAPP_BOUTONS_LANGUE = [('lang_ar', 'العربية'), ('lang_fr', 'Français')]
+WHATSAPP_TEXTES = {
+    'ar': {
+        'bienvenue': (
+            'مرحبًا بك في المساعد الرقمي لمدرسة EETFP-MPG 🎓\n'
+            'اختر موضوعًا من القائمة، أو اكتب سؤالك مباشرة.'
+        ),
+        'bouton_menu': 'عرض الخيارات',
+        'pied': '\n\n—\nاكتب 0 للقائمة الرئيسية، أو 00 لتغيير اللغة.',
+    },
+    'fr': {
+        'bienvenue': (
+            "Bienvenue sur l'assistant numérique de l'EETFP-MPG 🎓\n"
+            'Choisissez un sujet dans le menu, ou posez directement votre question.'
+        ),
+        'bouton_menu': 'Voir les options',
+        'pied': '\n\n—\nTapez 0 pour le menu principal, ou 00 pour changer de langue.',
+    },
+}
+WHATSAPP_MENU = [
+    ({'ar': 'المدرسة', 'fr': "L'école"}, [
+        ('menu_ecole', {
+            'ar': ('تعريف بالمدرسة', 'ما هي مدرسة MPG؟'),
+            'fr': ("Présentation de l'école", 'Qu’est-ce que l’école MPG ?'),
+        }),
+        ('menu_localisation', {
+            'ar': ('موقع المدرسة', 'أين تقع المدرسة بالضبط وكيف أصل إليها؟'),
+            'fr': ('Localisation', 'Où se trouve exactement l’école ?'),
+        }),
+        ('menu_contact', {
+            'ar': ('التواصل مع المدرسة', 'ما هو رقم هاتف المدرسة أو بريدها الإلكتروني؟'),
+            'fr': ("Contacter l'école", 'Quel est le téléphone ou l’e-mail de l’école ?'),
+        }),
+    ]),
+    ({'ar': 'التسجيل', 'fr': 'Inscription'}, [
+        ('menu_admission', {
+            'ar': ('شروط القبول', 'ما هي شروط القبول في المدرسة؟'),
+            'fr': ("Conditions d'admission", 'Quelles sont les conditions d’admission ?'),
+        }),
+        ('menu_dossier', {
+            'ar': ('ملف الترشح', 'ما هي وثائق ملف الترشح؟'),
+            'fr': ('Dossier de candidature', 'Que contient le dossier de candidature ?'),
+        }),
+        ('menu_dates', {
+            'ar': ('مواعيد التسجيل', 'متى تفتح التسجيلات؟'),
+            'fr': ("Dates d'inscription", 'Quand ouvrent les inscriptions ?'),
+        }),
+    ]),
+    ({'ar': 'التكوين', 'fr': 'Formation'}, [
+        ('menu_filieres', {
+            'ar': ('الشعب المتوفرة', 'كم عدد الشعب في المدرسة؟'),
+            'fr': ('Filières', 'Combien de filières propose l’école ?'),
+        }),
+        ('menu_duree', {
+            'ar': ('مدة الدراسة', 'كم تدوم الدراسة؟'),
+            'fr': ('Durée de la formation', 'Combien de temps dure la formation ?'),
+        }),
+        ('menu_examens', {
+            'ar': ('التقييم والامتحانات', 'كيف يتم تقييمي؟'),
+            'fr': ('Évaluations et examens', 'Comment suis-je évalué ?'),
+        }),
+        ('menu_stages', {
+            'ar': ('التربص', 'هل التربص إجباري؟'),
+            'fr': ('Stages', 'Le stage est-il obligatoire ?'),
+        }),
+    ]),
+]
+WHATSAPP_QUESTIONS_MENU = {
+    row_id: libelles for _, rows in WHATSAPP_MENU for row_id, libelles in rows
+}
+WHATSAPP_COMMANDES_MENU = {'0', 'menu', 'القائمة'}
+WHATSAPP_COMMANDES_LANGUE = {'00', 'langue', 'language', 'اللغة', 'لغة'}
+
+
+def _send_whatsapp_payload(recipient: str, message: dict) -> None:
     config = settings.MPG_ASSISTANT
     access_token = config['WHATSAPP_ACCESS_TOKEN']
     phone_number_id = config['WHATSAPP_PHONE_NUMBER_ID']
@@ -241,8 +319,7 @@ def send_whatsapp_message(recipient: str, text: str) -> None:
         'messaging_product': 'whatsapp',
         'recipient_type': 'individual',
         'to': recipient,
-        'type': 'text',
-        'text': {'preview_url': False, 'body': text[:4096]},
+        **message,
     }
     request = Request(
         url,
@@ -257,9 +334,62 @@ def send_whatsapp_message(recipient: str, text: str) -> None:
         with urlopen(request, timeout=20):
             return
     except HTTPError as exc:
-        raise RuntimeError(f'WhatsApp Cloud API returned HTTP {exc.code}.') from exc
+        details = exc.read().decode('utf-8', errors='replace')[:500]
+        raise RuntimeError(f'WhatsApp Cloud API returned HTTP {exc.code}: {details}') from exc
     except URLError as exc:
         raise RuntimeError('Could not reach WhatsApp Cloud API.') from exc
+
+
+def send_whatsapp_message(recipient: str, text: str) -> None:
+    _send_whatsapp_payload(recipient, {
+        'type': 'text',
+        'text': {'preview_url': False, 'body': text[:4096]},
+    })
+
+
+def send_whatsapp_language_choice(recipient: str) -> None:
+    _send_whatsapp_payload(recipient, {
+        'type': 'interactive',
+        'interactive': {
+            'type': 'button',
+            'body': {'text': WHATSAPP_INVITE_LANGUE},
+            'action': {'buttons': [
+                {'type': 'reply', 'reply': {'id': button_id, 'title': title}}
+                for button_id, title in WHATSAPP_BOUTONS_LANGUE
+            ]},
+        },
+    })
+
+
+def send_whatsapp_menu(recipient: str, langue: str, body: str | None = None) -> None:
+    textes = WHATSAPP_TEXTES[langue]
+    _send_whatsapp_payload(recipient, {
+        'type': 'interactive',
+        'interactive': {
+            'type': 'list',
+            'body': {'text': (body or textes['bienvenue'])[:1024]},
+            'action': {
+                'button': textes['bouton_menu'],
+                'sections': [
+                    {
+                        'title': titres[langue],
+                        'rows': [
+                            {'id': row_id, 'title': libelles[langue][0]}
+                            for row_id, libelles in rows
+                        ],
+                    }
+                    for titres, rows in WHATSAPP_MENU
+                ],
+            },
+        },
+    })
+
+
+def _whatsapp_choix(inbound: dict) -> tuple[str, str]:
+    """Retourne (identifiant, libellé) d'une réponse à un bouton ou à une liste."""
+    interactive = inbound.get('interactive', {})
+    reply = interactive.get('button_reply') or interactive.get('list_reply') or {}
+    return reply.get('id', ''), reply.get('title', '')
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -298,43 +428,89 @@ class WhatsAppWebhookView(APIView):
             for change in entry.get('changes', []):
                 value = change.get('value', {})
                 for inbound in value.get('messages', []):
-                    if inbound.get('type') != 'text':
-                        continue
-                    sender = inbound.get('from')
-                    message_id = inbound.get('id')
-                    text = inbound.get('text', {}).get('body', '').strip()
-                    if not sender or not message_id or not text:
-                        continue
-
                     try:
-                        conversation, _ = Conversation.objects.get_or_create(
-                            whatsapp_id=sender,
-                            defaults={
-                                'canal': 'whatsapp',
-                                'langue_detectee': _detecter_langue(text),
-                            },
-                        )
-                        previous_message = Message.objects.filter(
-                            external_id=message_id, role='user',
-                        ).select_related('conversation').first()
-                        if previous_message:
-                            previous_answer = previous_message.conversation.messages.filter(
-                                role='assistant',
-                                date_creation__gte=previous_message.date_creation,
-                            ).first()
-                            if previous_answer:
-                                send_whatsapp_message(sender, previous_answer.contenu)
-                            continue
-
-                        answer = ChatView().process({
-                            'message': text[:2000],
-                            'canal': 'whatsapp',
-                            'session_id': conversation.session_id,
-                            'external_message_id': message_id,
-                        })
-                        send_whatsapp_message(sender, answer['reponse'])
+                        self.handle_message(inbound)
                     except Exception:
                         logger.exception('Failed to process an incoming WhatsApp message.')
                         return HttpResponseServerError('Message processing failed.')
 
         return HttpResponse('EVENT_RECEIVED')
+
+    def handle_message(self, inbound: dict) -> None:
+        sender = inbound.get('from')
+        message_id = inbound.get('id')
+        message_type = inbound.get('type')
+        if not sender or not message_id or message_type not in ('text', 'interactive'):
+            return
+
+        if message_type == 'text':
+            text = inbound.get('text', {}).get('body', '').strip()
+            choix_id, choix_titre = '', ''
+        else:
+            choix_id, choix_titre = _whatsapp_choix(inbound)
+            text = ''
+        if not text and not choix_id:
+            return
+
+        # Meta renvoie un événement non acquitté : on ne le traite qu'une fois,
+        # mais on renvoie la réponse déjà produite au cas où l'envoi avait échoué.
+        previous_message = Message.objects.filter(
+            external_id=message_id, role='user',
+        ).select_related('conversation').first()
+        if previous_message:
+            next_message = previous_message.conversation.messages.filter(
+                date_creation__gte=previous_message.date_creation,
+            ).exclude(pk=previous_message.pk).order_by('date_creation').first()
+            if next_message and next_message.role == 'assistant':
+                send_whatsapp_message(sender, next_message.contenu)
+            return
+
+        # langue_detectee vide = l'utilisateur n'a pas encore choisi sa langue.
+        conversation, created = Conversation.objects.get_or_create(
+            whatsapp_id=sender,
+            defaults={'canal': 'whatsapp', 'langue_detectee': ''},
+        )
+        langue_choisie = conversation.langue_detectee
+
+        def enregistrer_action(contenu: str) -> None:
+            Message.objects.create(
+                conversation=conversation, role='user', contenu=contenu,
+                external_id=message_id,
+            )
+
+        commande = text.lower()
+        if choix_id in ('lang_ar', 'lang_fr'):
+            enregistrer_action(choix_titre or choix_id)
+            conversation.langue_detectee = choix_id.removeprefix('lang_')
+            conversation.save(update_fields=['langue_detectee', 'date_derniere_activite'])
+            send_whatsapp_menu(sender, conversation.langue_detectee)
+            return
+
+        if not langue_choisie or commande in WHATSAPP_COMMANDES_LANGUE:
+            enregistrer_action(text or choix_titre or choix_id)
+            send_whatsapp_language_choice(sender)
+            return
+
+        if commande in WHATSAPP_COMMANDES_MENU:
+            enregistrer_action(text)
+            send_whatsapp_menu(sender, langue_choisie)
+            return
+
+        if choix_id in WHATSAPP_QUESTIONS_MENU:
+            langue = langue_choisie
+            question = WHATSAPP_QUESTIONS_MENU[choix_id][langue][1]
+        elif text:
+            # Une question libre reçoit une réponse dans la langue où elle est écrite.
+            langue = _detecter_langue(text)
+            question = text[:2000]
+        else:
+            return
+
+        answer = ChatView().process({
+            'message': question,
+            'langue': langue,
+            'canal': 'whatsapp',
+            'session_id': conversation.session_id,
+            'external_message_id': message_id,
+        })
+        send_whatsapp_message(sender, answer['reponse'] + WHATSAPP_TEXTES[langue]['pied'])
